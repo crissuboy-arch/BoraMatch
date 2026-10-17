@@ -22,6 +22,15 @@ insert into public.cities values
  ('braga','Braga','PT',41.55,-8.43,true),('coimbra','Coimbra','PT',40.20,-8.41,true),
  ('faro','Faro','PT',37.02,-7.93,true),('sao-paulo','São Paulo','BR',-23.55,-46.63,true),
  ('rio-de-janeiro','Rio de Janeiro','BR',-22.91,-43.17,true);
+-- Historical provider prices survive plan configuration changes. Only the trusted RPC may append.
+create table public.plan_prices (
+ stripe_price_id text primary key check(length(btrim(stripe_price_id)) between 1 and 255),
+ plan_id text not null references public.plans(id), price_cents int not null check(price_cents>=0),
+ currency text not null check(currency ~ '^[A-Z]{3}$'),created_at timestamptz not null default now()
+);
+create function private.immutable_plan_price() returns trigger language plpgsql security invoker set search_path='' as $$
+begin raise exception 'immutable_plan_price' using errcode='23514'; end $$;
+create trigger immutable_plan_prices before update or delete on public.plan_prices for each row execute function private.immutable_plan_price();
 create table public.profiles (
  id uuid primary key references auth.users(id) on delete cascade,
  display_name text not null check(length(btrim(display_name)) between 2 and 60),
@@ -114,6 +123,8 @@ do $$ declare t record; begin
 end $$;
 grant select on public.cities,public.plans,public.profiles,public.consents,public.subscriptions,public.decisions,public.matches,public.messages,public.read_receipts,public.blocks,public.reports,public.photos to authenticated;
 grant select on public.cities,public.plans to anon;
+revoke all on public.plan_prices from public,anon,authenticated,service_role;
+grant select on public.plan_prices to service_role;
 create policy active_cities on public.cities for select to anon,authenticated using(active);
 create policy active_plans on public.plans for select to anon,authenticated using(active);
 create policy own_profile on public.profiles for select to authenticated using(id=(select auth.uid()));
@@ -205,6 +216,7 @@ declare u uuid:=private.actor(); result jsonb; begin
  p_city:=coalesce(p_city,nullif(p_filters->>'city','')); p_gender:=coalesce(p_gender,nullif(p_filters->>'gender',''));
  p_min_age:=coalesce(p_min_age,(p_filters->>'min_age')::int); p_max_age:=coalesce(p_max_age,(p_filters->>'max_age')::int);
  p_interest:=coalesce(p_interest,nullif(p_filters->>'interest',''));p_max_distance:=coalesce(p_max_distance,(p_filters->>'max_distance')::int);
+ if p_interest is not null and coalesce((private.plan_for(u)).id,'free')='free' then raise exception 'plus_required' using errcode='42501'; end if;
  select coalesce(jsonb_agg(private.card(id,u) order by boosted desc nulls last,shared_count desc,created_at desc,id),'[]'::jsonb) into result from (select id,created_at,(boost_until>now()) as boosted,cardinality(array(select unnest(interests) intersect select unnest((select interests from public.profiles where id=u)))) as shared_count from public.profiles where private.eligible(u,id) and (p_city is null or city_id=p_city) and (p_gender is null or gender=p_gender) and (p_interest is null or p_interest=any(interests)) and (p_min_age is null or (select extract(year from age(current_date,dob)) from private.identities where user_id=id)>=p_min_age) and (p_max_age is null or (select extract(year from age(current_date,dob)) from private.identities where user_id=id)<=p_max_age) and (p_max_distance is null or private.distance(city_id,(select city_id from public.profiles where id=u))<=p_max_distance) order by boosted desc nulls last,shared_count desc,created_at desc,id limit greatest(1,least(coalesce(p_limit,20),50))) q;
  return result;
 end $$;
@@ -335,7 +347,7 @@ declare u uuid; owner_id uuid; begin
  exception when insufficient_privilege then return false;
 end $$;
 insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types) values('profile-photos','profile-photos',false,8388608,array['image/jpeg','image/png','image/webp']);
-create policy photo_upload on storage.objects for insert to authenticated with check(bucket_id='profile-photos' and private.photo_access(name,true));
+-- No client INSERT policy: the authenticated API must sanitize/re-encode before service-role upload.
 create policy photo_read on storage.objects for select to authenticated using(bucket_id='profile-photos' and private.photo_access(name,false));
 create policy photo_delete on storage.objects for delete to authenticated using(bucket_id='profile-photos' and (storage.foldername(name))[1]=(select auth.uid())::text);
 -- No UPDATE policy: replacement must reserve a new UUID path.
@@ -354,7 +366,11 @@ begin
  if not found then raise exception 'unknown_user' using errcode='22023'; end if;
  insert into private.billing_events(event_id,user_id) values(p_event_id,p_user) on conflict do nothing;
  if not found then return jsonb_build_object('applied',false,'reason','duplicate'); end if;
- if exists(select 1 from private.billing_accounts where user_id=p_user and event_created>=p_event_created) then return jsonb_build_object('applied',false,'reason','stale'); end if;
+ if exists(select 1 from private.billing_accounts where user_id=p_user and event_created>p_event_created) then return jsonb_build_object('applied',false,'reason','stale'); end if;
+ -- Conservative same-second ordering: a revocation cannot be overwritten by a concurrent activation.
+ if exists(select 1 from private.billing_accounts b join public.subscriptions s on s.user_id=b.user_id
+ where b.user_id=p_user and b.event_created=p_event_created and s.status not in ('active','trialing'))
+ and p_status in ('active','trialing') then return jsonb_build_object('applied',false,'reason','tie_restrictive'); end if;
  insert into private.billing_accounts(user_id,customer_id,subscription_id,event_created,event_id) values(p_user,p_customer,p_subscription,p_event_created,p_event_id)
  on conflict(user_id) do update set customer_id=excluded.customer_id,subscription_id=excluded.subscription_id,event_created=excluded.event_created,event_id=excluded.event_id;
  update public.subscriptions set plan_id=p_plan,status=p_status,period_end=p_period_end,updated_at=now() where user_id=p_user;
@@ -369,7 +385,7 @@ declare u uuid:=private.actor(); begin
 end $$;
 create function private.admin_metrics() returns jsonb language plpgsql stable security definer set search_path='' as $$
 begin perform private.require_admin(true);
- return jsonb_build_object('profiles',(select count(*) from public.profiles),'active_profiles',(select count(*) from public.profiles where status='active'),'matches',(select count(*) from public.matches where ended_at is null),'messages_count',(select count(*) from public.messages),'open_reports',(select count(*) from public.reports where status='open'),'new7d',(select count(*) from public.profiles where created_at>now()-interval '7 days'),'active30d',(select count(*) from public.profiles p where p.status='active' and (p.updated_at>now()-interval '30 days' or exists(select 1 from public.decisions d where d.user_id=p.id and d.created_at>now()-interval '30 days') or exists(select 1 from public.messages m where m.sender_id=p.id and m.created_at>now()-interval '30 days'))),'estimated_mrr_cents',coalesce((select sum(p.price_cents) from public.subscriptions s join public.plans p on p.id=s.plan_id where s.status in ('active','trialing') and s.period_end>now()),0),'conversion_rate',coalesce((select count(*) filter(where s.plan_id<>'free' and s.status in ('active','trialing') and s.period_end>now())::numeric/nullif(count(*),0) from public.profiles p left join public.subscriptions s on s.user_id=p.id),0),'paid_subscriptions',(select count(*) from public.subscriptions where plan_id<>'free' and status in ('active','trialing') and period_end>now()));
+ return jsonb_build_object('registered_users',(select count(*) from auth.users where coalesce(is_anonymous,false)=false),'profiles',(select count(*) from public.profiles),'active_profiles',(select count(*) from public.profiles where status='active'),'matches',(select count(*) from public.matches where ended_at is null),'messages_count',(select count(*) from public.messages),'open_reports',(select count(*) from public.reports where status='open'),'new7d',(select count(*) from public.profiles where created_at>now()-interval '7 days'),'active30d',(select count(*) from public.profiles p where p.status='active' and (p.updated_at>now()-interval '30 days' or exists(select 1 from public.decisions d where d.user_id=p.id and d.created_at>now()-interval '30 days') or exists(select 1 from public.messages m where m.sender_id=p.id and m.created_at>now()-interval '30 days'))),'estimated_mrr_cents',coalesce((select sum(p.price_cents) from public.subscriptions s join public.plans p on p.id=s.plan_id where s.status in ('active','trialing') and s.period_end>now()),0),'conversion_rate',coalesce((select count(*) filter(where s.plan_id<>'free' and s.status in ('active','trialing') and s.period_end>now())::numeric/nullif(count(*),0) from public.profiles p left join public.subscriptions s on s.user_id=p.id),0),'paid_subscriptions',(select count(*) from public.subscriptions where plan_id<>'free' and status in ('active','trialing') and period_end>now()));
 end $$;
 create function private.admin_reports() returns jsonb language plpgsql stable security definer set search_path='' as $$
 declare result jsonb; begin perform private.require_admin();
@@ -392,6 +408,11 @@ declare u uuid:=private.require_admin(true); p public.plans; begin
  values(p_plan->>'id',(p_plan->>'daily_likes')::int,(p_plan->>'daily_superlikes')::int,(p_plan->>'rewind')::boolean,(p_plan->>'see_likes')::boolean,(p_plan->>'monthly_boosts')::int,(p_plan->>'boost_minutes')::int,coalesce((p_plan->>'price_cents')::int,0),coalesce(p_plan->>'currency','EUR'),p_plan->>'stripe_price_id',coalesce((p_plan->>'active')::boolean,true))
  on conflict(id) do update set daily_likes=excluded.daily_likes,daily_superlikes=excluded.daily_superlikes,rewind=excluded.rewind,see_likes=excluded.see_likes,monthly_boosts=excluded.monthly_boosts,boost_minutes=excluded.boost_minutes,price_cents=excluded.price_cents,currency=excluded.currency,stripe_price_id=excluded.stripe_price_id,active=excluded.active returning * into p;
  if p.id='free' and not p.active then raise exception 'free_plan_required'; end if;
+ if p.stripe_price_id is not null then
+ insert into public.plan_prices(stripe_price_id,plan_id,price_cents,currency) values(p.stripe_price_id,p.id,p.price_cents,p.currency) on conflict(stripe_price_id) do nothing;
+ if not exists(select 1 from public.plan_prices h where h.stripe_price_id=p.stripe_price_id and h.plan_id=p.id and h.price_cents=p.price_cents and h.currency=p.currency) then
+ raise exception 'stripe_price_mapping_conflict' using errcode='23514'; end if;
+ end if;
  insert into private.audit_log(actor_id,action,reason) values(u,'save_plan',p.id); return to_jsonb(p);
 end $$;
 create function private.admin_save_city(p_city jsonb) returns jsonb language plpgsql security definer set search_path='' as $$
@@ -495,5 +516,3 @@ create function public.before_user_created(event jsonb) returns jsonb language s
 revoke all on function private.before_user_created(jsonb),public.before_user_created(jsonb) from public,anon,authenticated,service_role;
 grant usage on schema private,public to supabase_auth_admin;
 grant execute on function private.before_user_created(jsonb),public.before_user_created(jsonb) to supabase_auth_admin;
-
-

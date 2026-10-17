@@ -37,7 +37,7 @@ test('BoraMatch actual migration / authorization integration',async t=>{
  create table storage.buckets(id text primary key,name text,public boolean,file_size_limit bigint,allowed_mime_types text[]);
  create table storage.objects(id uuid primary key default gen_random_uuid(),bucket_id text references storage.buckets(id),name text not null,owner_id text,unique(bucket_id,name));
  alter table storage.objects enable row level security;
- grant select,insert,update,delete on storage.objects to authenticated;
+ grant select,insert,update,delete on storage.objects to authenticated; grant select,insert,update,delete on storage.objects to service_role;
  create function storage.foldername(text) returns text[] language sql immutable as $$select (string_to_array($1,'/'))[1:array_length(string_to_array($1,'/'),1)-1]$$;
  `);
  const migrations=(await readdir(new URL('supabase/migrations/',root))).filter(x=>x.endsWith('.sql')).sort();
@@ -135,7 +135,9 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   await as('authenticated',ids[0]);
   const paths=[]; for(let i=1;i<=9;i++) paths.push((await rpc('reserve_photo',{p_slot:i,p_extension:'jpg'})).path);
   await rejects(rpc('reserve_photo',{p_slot:10,p_extension:'jpg'}),/invalid_photo/); await rejects(rpc('reserve_photo',{p_slot:1,p_extension:'svg'}),/invalid_photo/);
-  await sql("insert into storage.objects(bucket_id,name,owner_id) values('profile-photos',$1,$2)",[paths[0],ids[0]]);
+  await rejects(sql("insert into storage.objects(bucket_id,name,owner_id) values('profile-photos',$1,$2)",[paths[0],ids[0]]),/row-level security/);
+  await as('service_role');await sql("insert into storage.objects(bucket_id,name,owner_id) values('profile-photos',$1,$2)",[paths[0],ids[0]]);
+  await as('authenticated',ids[0]);
   await rejects(sql("insert into storage.objects(bucket_id,name) values('profile-photos',$1)",[`${ids[0]}/unreserved.jpg`]),/row-level security/);
   assert.equal((await sql('select * from storage.objects')).length,1);
   await sql("update storage.objects set name='hacked'"); assert.equal((await sql('select name from storage.objects'))[0].name,paths[0]);
@@ -155,7 +157,7 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   await as('authenticated',ids[2]); await rpc('report_user',{p_target:ids[3],p_reason:'spam',p_details:'abuse context'});
   await as('authenticated',ids[3]); assert.equal((await sql('select * from public.reports')).length,0); await rejects(rpc('admin_reports'),/admin_required/);
   await owner("insert into private.admin_roles values($1,'admin'),($2,'moderator')",[ids[0],ids[1]]);
-  await as('authenticated',ids[0]); const metrics=await rpc('admin_metrics'); assert.equal(metrics.messages_count,20); assert.ok(!JSON.stringify(metrics).includes('hello'));
+  await as('authenticated',ids[0]); const metrics=await rpc('admin_metrics'); assert.equal(metrics.registered_users,ids.length); assert.ok(metrics.registered_users>metrics.profiles); assert.equal(metrics.messages_count,20); assert.ok(!JSON.stringify(metrics).includes('hello'));
   assert.equal((await rpc('admin_reports')).length,1);
   await rpc('admin_moderate',{p_target:ids[3],p_action:'suspend',p_reason:'spam verified'});
   await as('authenticated',ids[3]); await rejects(rpc('discover'),/active_profile_required/);
@@ -192,7 +194,7 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   await rejects(rpc('complete_onboarding',{p_profile:profile(2)}),/authentication_required/);
   await as('service_role'); assert.equal((await rpc('retention_cleanup')).ok,true);
  });
- 
+
  await t.test('Auth before-user-created hook independently rejects direct underage/anonymous/malformed signups',async()=>{
   await as('supabase_auth_admin');
   for(const metadata of [{},{dob:'invalid'},{dob:'2015-01-01'},{dob:'3000-01-01'}]){
@@ -215,6 +217,10 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   await onboard(8,{interests:['cooking'],max_distance_km:20000});await onboard(9,{interests:['music'],city_id:'porto',max_distance_km:20000});
   await onboard(10,{interests:['music'],max_distance_km:20000});
   await as('authenticated',ids[10]);
+  await rejects(rpc('discover',{p_interest:'music'}),/plus_required/);
+  await rejects(rpc('discover',{p_filters:{interest:'music'}}),/plus_required/);
+  assert.ok((await rpc('discover',{p_filters:{city:'porto',min_age:18,max_age:50,max_distance:1000,gender:'woman'}})).some(c=>c.id===ids[9]));
+  await paid(10,'plus','interest-plus-access');await as('authenticated',ids[10]);
   const cards=await rpc('discover',{p_limit:1,p_city:'porto',p_min_age:18,p_max_age:50,p_interest:'music',p_max_distance:1000,p_gender:'woman'});
   assert.equal(cards.length,1);assert.equal(cards[0].id,ids[9]);
   const jsonCards=await rpc('discover',{p_limit:1,p_filters:{city:'porto',min_age:18,max_age:50,interest:'music',max_distance:1000,gender:'woman'}});assert.equal(jsonCards[0].id,ids[9]);assert.deepEqual(jsonCards[0].shared_interests,['music']);
@@ -228,13 +234,13 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   const plans=await sql('select * from public.plans order by id');assert.equal(plans.find(p=>p.id==='plus').price_cents,990);assert.equal(plans.find(p=>p.id==='gold').price_cents,1990);
   await rpc('admin_save_plan',{p_plan:{...plans.find(p=>p.id==='plus'),stripe_price_id:'price_plus_test'}});
   const city=await rpc('admin_save_city',{p_city:{id:'aveiro',name:'Aveiro',country:'PT',latitude:40.6404,longitude:-8.6538,active:true}});assert.equal(Number(city.latitude),40.64);
-  const metrics=await rpc('admin_metrics');assert.ok(metrics.new7d>0);assert.ok(metrics.active30d>0);assert.equal(metrics.estimated_mrr_cents,1990);assert.ok(Number(metrics.conversion_rate)>0);
+  const metrics=await rpc('admin_metrics');assert.ok(metrics.new7d>0);assert.ok(metrics.active30d>0);assert.equal(metrics.estimated_mrr_cents,2980);assert.ok(Number(metrics.conversion_rate)>0);
   await rejects(rpc('billing_account',{p_user:ids[0]}),/permission denied/);
   await as('authenticated',ids[7]);assert.deepEqual(await rpc('is_admin'),{is_admin:false,role:null});
   await as('service_role');assert.equal((await rpc('billing_account',{p_user:ids[0]})).customer_id,'cus-0');
   await as('authenticated',ids[0]);await rejects(rpc('purge_deleted_accounts'),/permission denied/);
  });
- 
+
  await t.test('discovery ranks observable shared interests before recency without widening eligibility',async()=>{
   await onboard(11,{interests:['music','hiking','cooking']});
   await onboard(12,{interests:['music']});
@@ -250,8 +256,34 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   await as('service_role');await rpc('purge_deleted_accounts');queue=await rpc('billing_cancellation_queue');assert.ok(queue.some(x=>x.id===entry.id));
   await rpc('ack_billing_cancellation',{p_ids:[entry.id]});assert.ok(!(await rpc('billing_cancellation_queue')).some(x=>x.id===entry.id));
  });
+
+ await t.test('same-second billing revocations win in both arrival orders; newer event may restore',async()=>{
+  const stamp=new Date(Date.now()-5000).toISOString();const newer=new Date(Date.now()-1000).toISOString();
+  for(const [i,reverse] of [[13,false],[14,true]]){
+   await onboard(i);await as('service_role');
+   const base={p_user:ids[i],p_plan:'gold',p_customer:'cus-tie-'+i,p_subscription:'sub-tie-'+i,p_event_created:stamp,p_period_end:new Date(Date.now()+86400000).toISOString()};
+   const first=await rpc('apply_billing_event',{...base,p_event_id:'tie-first-'+i,p_status:reverse?'canceled':'active'});assert.equal(first.applied,true);
+   const second=await rpc('apply_billing_event',{...base,p_event_id:'tie-second-'+i,p_status:reverse?'active':'canceled'});
+   assert.equal(second.reason,reverse?'tie_restrictive':'applied');
+   await as('authenticated',ids[i]);assert.equal((await rpc('my_profile')).plan,'free');
+   await as('service_role');assert.equal((await rpc('apply_billing_event',{...base,p_event_id:'tie-second-'+i,p_status:reverse?'active':'canceled'})).reason,'duplicate');
+   assert.equal((await rpc('apply_billing_event',{...base,p_event_id:'tie-newer-'+i,p_status:'active',p_event_created:newer})).applied,true);
+   await as('authenticated',ids[i]);assert.equal((await rpc('my_profile')).plan,'gold');
+  }
+ });
+ await t.test('historical Stripe price mappings are immutable, service-read-only and preserve prior prices',async()=>{
+  await as('authenticated',ids[0]);
+  const current=(await sql("select * from public.plans where id='plus'"))[0];
+  await rejects(sql('select * from public.plan_prices'),/permission denied/);
+  await rpc('admin_save_plan',{p_plan:{...current,stripe_price_id:'price_plus_v2',price_cents:1290}});
+  await rpc('admin_save_plan',{p_plan:{...current,stripe_price_id:'price_plus_v2',price_cents:1290}});
+  await rejects(rpc('admin_save_plan',{p_plan:{...current,stripe_price_id:'price_plus_test',price_cents:1290}}),/stripe_price_mapping_conflict/);
+  assert.equal((await sql("select stripe_price_id from public.plans where id='plus'"))[0].stripe_price_id,'price_plus_v2');
+  await as('service_role');const rows=await sql("select * from public.plan_prices where plan_id='plus' order by price_cents");
+  assert.deepEqual(rows.map(x=>[x.stripe_price_id,x.price_cents,x.currency]),[['price_plus_test',990,'EUR'],['price_plus_v2',1290,'EUR']]);
+  for(const q of ["update public.plan_prices set price_cents=1","delete from public.plan_prices","insert into public.plan_prices(stripe_price_id,plan_id,price_cents,currency) values('forged','gold',1,'EUR')"]){await rejects(sql(q),/permission denied/);}
+  await owner('select 1');await rejects(sql("update public.plan_prices set price_cents=1"),/immutable_plan_price/);await rejects(sql('delete from public.plan_prices'),/immutable_plan_price/);
+  await as('anon');await rejects(sql('select * from public.plan_prices'),/permission denied/);
+ });
  await db.close();
 });
-
-
-
