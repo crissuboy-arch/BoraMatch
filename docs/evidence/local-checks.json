@@ -1,0 +1,15 @@
+{
+  "date": "2026-10-17",
+  "environment": "Windows, Node 22.22.0, npm 10.9.4",
+  "applicationCommit": "4387879348021d9eaf0f7d452a6e9eaaa4c66645",
+  "note": "Later CSS accessibility fixes are covered by the separate final browser report.",
+  "checks": {
+    "eslint": {"command": "npm run lint", "exitCode": 0},
+    "typescript": {"command": "npm run typecheck", "exitCode": 0},
+    "vitest": {"passed": 55, "failed": 0, "stripeMocked": 40, "photos": 10, "validation": 5},
+    "database": {"reportedPassed": 23, "scenarioSubtests": 22, "failed": 0, "engine": "PGlite with Auth/Storage fixtures"},
+    "dependencyAudit": {"command": "npm audit --json", "totalVulnerabilities": 0},
+    "retentionWorkerSyntax": {"command": "node --check scripts/retention.mjs", "exitCode": 0}
+  },
+  "externalVerification": {"githubPublished": false, "remoteCi": false, "hostedSupabase": false, "stripeApi": false, "scheduledCleanup": false}
+}

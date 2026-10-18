@@ -2652,3 +2652,48 @@ footer > nav {
 footer > nav > a {
   margin: 0 !important;
 }
+/* Final accessibility contrast corrections: light discovery and dark landing. */
+.daily-note > p {
+  color: #48505c;
+}
+.note-signature {
+  color: #68451f;
+}
+html[data-theme="dark"] .daily-note > p {
+  color: #bdc3d0;
+}
+html[data-theme="dark"] .note-signature {
+  color: #dab675;
+}
+html[data-theme="dark"] .synthetic-label {
+  color: #bdc3d0;
+}
+html[data-theme="dark"] .scribble {
+  color: #dab675;
+}
+/* Decorative hero layers must never intercept controls. */
+.orbit,
+.orbit::before,
+.orbit::after {
+  pointer-events: none;
+}
+.theme-switch {
+  z-index: 90;
+  pointer-events: auto;
+  isolation: isolate;
+}
+/* Contain oversized decorative artwork within the actual mobile viewport. */
+@media (max-width: 850px) {
+  .hero {
+    overflow: clip;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .hero-copy,
+  .hero-visual {
+    min-width: 0;
+  }
+}
+html[data-theme="dark"] .mobile-nav > button.active {
+  color: #e3bf7d;
+}

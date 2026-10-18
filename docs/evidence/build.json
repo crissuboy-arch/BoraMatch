@@ -1,0 +1,19 @@
+{
+  "date": "2026-10-17",
+  "command": "npm run build",
+  "exitCode": 0,
+  "node": "22.22.0",
+  "next": "16.4.2",
+  "applicationCommit": "4387879348021d9eaf0f7d452a6e9eaaa4c66645",
+  "workingTreeNote": "Includes subsequent CSS-only contrast, pointer interception and mobile hero overflow corrections.",
+  "buildId": "-nQ5vQTeCChsSOiVzFj1P",
+  "cssSha256": "9942e23e000a8e1849b2722e81f8eec3c438dab4f6a2fc8162881823bf75e9da",
+  "verified": [
+    "Production compilation",
+    "TypeScript during build",
+    "Static route generation",
+    "API route inclusion including photos"
+  ],
+  "warning": "Next.js ignored an unrelated package-lock.json outside this Git repository.",
+  "deployed": false
+}
