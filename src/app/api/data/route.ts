@@ -92,7 +92,9 @@ export async function GET(request: Request) {
           (p.age || 18) >= min &&
           (p.age || 18) <= max &&
           (!city ||
-            (p.city_name || p.city_id).toLocaleLowerCase().includes(city)) &&
+            p.city_id === cityFilter ||
+            p.city_id.toLocaleLowerCase() === city ||
+            (p.city_name || "").toLocaleLowerCase() === city) &&
           (!interest || p.interests.includes(interest)) &&
           (!gender || p.gender === gender) &&
           (!("distance_km" in p) || Number(p.distance_km) <= distance),
@@ -116,9 +118,25 @@ export async function GET(request: Request) {
         })),
       );
     } else if (resource === "messages") {
+      const before = params.get("before");
+      const beforeId = params.get("beforeId");
+      if (beforeId !== null && (before === null || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(beforeId)))
+        throw new Error("Cursor de mensagens inválido.");
+      // Keep the original string: Date.toISOString would truncate SQL microseconds.
+      if (before !== null) {
+        const iso = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+        const day = before.slice(0, 10);
+        if (!iso.test(before) || !Number.isFinite(Date.parse(before)) ||
+          new Date(day + "T00:00:00Z").toISOString().slice(0, 10) !== day)
+          throw new Error("Cursor de mensagens inválido.");
+      }
       const rows = await rpc<
         { id: string; sender_id: string; body: string; created_at: string }[]
-      >(db, "get_messages", { p_match: params.get("matchId") });
+      >(db, "get_messages_page", {
+        p_match: params.get("matchId"),
+        ...(before !== null ? { p_before: before } : {}),
+        ...(beforeId !== null ? { p_before_id: beforeId } : {}),
+      });
       data = rows.map((m) => ({
         id: m.id,
         senderId: m.sender_id,
