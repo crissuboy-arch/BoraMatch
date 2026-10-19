@@ -131,6 +131,24 @@ test('BoraMatch actual migration / authorization integration',async t=>{
   await as('authenticated',ids[1]); assert.equal((await rpc('get_messages',{p_match:match})).length,20); assert.equal((await rpc('list_matches'))[0].unread_count,20);
   assert.ok((await rpc('mark_read',{p_match:match})).read_at); assert.equal((await rpc('list_matches'))[0].unread_count,0);
  });
+ await t.test('F04 composite pagination traverses 225 identical timestamps without loss; authorization',async()=>{
+  await owner("insert into public.messages(id,match_id,sender_id,body,created_at) select ('10000000-0000-4000-8000-'||lpad(i::text,12,'0'))::uuid,$1,$2,'tie '||i,'2020-01-01T12:00:00.123456Z'::timestamptz from generate_series(1,225) i",[match,ids[0]]);
+  await as('authenticated',ids[1]);
+  let cursor={p_match:match,p_before:'2020-01-02T00:00:00Z'}, seen=[];
+  for(const size of [100,100,25]) {
+   const page=await rpc('get_messages_page',cursor); assert.equal(page.length,size);
+   const sorted=[...page].sort((a,b)=>a.id.localeCompare(b.id)); assert.deepEqual(page,sorted);
+   seen.push(...page.map(m=>m.id)); cursor={p_match:match,p_before:page[0].created_at,p_before_id:page[0].id};
+  }
+  assert.equal(new Set(seen).size,225);
+  assert.deepEqual([...seen].sort(),Array.from({length:225},(_,i)=>`10000000-0000-4000-8000-${String(i+1).padStart(12,'0')}`));
+  assert.equal((await rpc('get_messages_page',cursor)).length,0);
+  assert.equal((await rpc('get_messages',{p_match:match,p_before:'2020-01-02T00:00:00Z'})).length,100);
+  await as('authenticated',ids[2]); await rejects(rpc('get_messages_page',{p_match:match}),/match_forbidden/);
+  await as('anon'); await rejects(rpc('get_messages_page',{p_match:match}),/permission denied/);
+  await as('authenticated'); await rejects(rpc('get_messages_page',{p_match:match}),/authentication_required/);
+  await owner("delete from public.messages where match_id=$1 and created_at<'2020-01-02'",[match]);
+ });
  await t.test('private photos ownership, maximum nine, signed-read predicate and no upsert',async()=>{
   await as('authenticated',ids[0]);
   const paths=[]; for(let i=1;i<=9;i++) paths.push((await rpc('reserve_photo',{p_slot:i,p_extension:'jpg'})).path);
