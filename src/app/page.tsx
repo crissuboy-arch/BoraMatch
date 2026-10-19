@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { Brand, Portrait } from "@/components/Identity";
 import { browserClient } from "@/lib/supabase/browser";
+import { mergeMessages } from "@/lib/messages";
 type Profile = {
   id: string;
   name: string;
@@ -177,17 +178,73 @@ export default function Home() {
         targetId: string;
       }[];
     } | null>(null);
+  // Epochs change synchronously, before React effects clean up old requests.
+  const identityEpoch = useRef(0);
+  const identity = useRef<string | null>(null);
+  const demoMode = useRef(false);
+  const sessionRequest = useRef(0);
+  const chatEpoch = useRef(0);
+  const selectedChat = useRef<string | null>(null);
+  const messagesRef = useRef<Msg[]>([]);
+  const historyCursor = useRef<{ createdAt: string; id: string } | null>(null);
+  const historyPending = useRef(false);
+  const [hasOlder, setHasOlder] = useState(false);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const resetChat = useCallback(() => {
+    chatEpoch.current++;
+    selectedChat.current = null;
+    historyCursor.current = null;
+    historyPending.current = false;
+    messagesRef.current = [];
+    setMatch(null);
+    setMessages([]);
+    setHasOlder(false);
+    setHistoryBusy(false);
+    setChatError("");
+  }, []);
+  const clearPrivate = useCallback(() => {
+    identityEpoch.current++;
+    identity.current = null;
+    resetChat();
+    setSession(null);
+    setProfile(null);
+    setPeople([]);
+    setIndex(0);
+    setMatches([]);
+    setAdmin(null);
+    setFilters({});
+    setShowFilters(false);
+    setConfirm("");
+    setNotice("");
+    setBusy(false);
+    setCities([]);
+    setPlans([]);
+  }, [resetChat]);
   const get = useCallback(
-    async (resource: string, extra = "") =>
-      (await api("/api/data?resource=" + resource + extra)).data,
+    async (resource: string, extra = "") => {
+      const epoch = identityEpoch.current;
+      const result = await api("/api/data?resource=" + resource + extra);
+      if (epoch !== identityEpoch.current) throw Error("");
+      return result.data;
+    },
     [],
   );
   const load = useCallback(async () => {
+    if (demoMode.current) return;
+    const request = ++sessionRequest.current;
+    const epoch = identityEpoch.current;
     try {
       const s = await get("session");
+      if (request !== sessionRequest.current || epoch !== identityEpoch.current) return;
+      if ((s?.user?.id || null) !== identity.current) {
+        clearPrivate();
+        identity.current = s?.user?.id || null;
+      }
       setSession(s);
       if (s?.user) {
         const p = await get("profile");
+        if (request !== sessionRequest.current) return;
         setProfile(p);
         if (!p) {
           setTab("profile");
@@ -197,7 +254,18 @@ export default function Home() {
     } catch (e) {
       setNotice((e as Error).message);
     }
-  }, [get]);
+  }, [get, clearPrivate]);
+  useEffect(() => {
+    const client = browserClient();
+    if (!client) return;
+    // Do not await Supabase calls inside its auth callback (auth lock).
+    const { data } = client.auth.onAuthStateChange((_event, next) => {
+      if (demoMode.current) return;
+      if ((next?.user?.id || null) !== identity.current) clearPrivate();
+      window.setTimeout(() => { void load(); }, 0);
+    });
+    return () => data.subscription.unsubscribe();
+  }, [clearPrivate, load]);
   useEffect(() => {
     const sync = () => {
       const params = new URLSearchParams(location.search);
@@ -226,6 +294,7 @@ export default function Home() {
   useEffect(() => {
     if (!app || demo || !session?.user) return;
     let live = true;
+    const epoch = identityEpoch.current;
     const resource =
       tab === "discover"
         ? "discover"
@@ -243,7 +312,7 @@ export default function Home() {
       resource === "discover" ? "&" + new URLSearchParams(filters) : "",
     )
       .then((d) => {
-        if (!live) return;
+        if (!live || epoch !== identityEpoch.current) return;
         if (resource === "discover" || resource === "likes") {
           setPeople(d || []);
           setIndex(0);
@@ -251,22 +320,48 @@ export default function Home() {
         if (resource === "matches") setMatches(d || []);
         if (resource === "admin") setAdmin(d);
       })
-      .catch((e) => setNotice(e.message))
+      .catch((e) => { if (live && epoch === identityEpoch.current) setNotice(e.message); })
       .finally(() => {
-        if (live) setBusy(false);
+        if (live && epoch === identityEpoch.current) setBusy(false);
       });
     return () => {
       live = false;
     };
   }, [app, demo, session, tab, filters, get]);
   const refreshMessages = useCallback(
-    async (id: string) => {
+    async (id: string, older = false) => {
+      if (selectedChat.current !== id || demoMode.current || !identity.current) return;
+      if (older && (historyPending.current || !historyCursor.current)) return;
+      const epoch = identityEpoch.current, chat = chatEpoch.current;
+      const valid = () => epoch === identityEpoch.current && chat === chatEpoch.current && selectedChat.current === id;
+      const before = older ? historyCursor.current : null;
+      if (older) { historyPending.current = true; setHistoryBusy(true); }
+      setChatError("");
       try {
-        setMessages(
-          (await get("messages", "&matchId=" + encodeURIComponent(id))) || [],
-        );
+        const rows: Msg[] = (await get("messages", "&matchId=" + encodeURIComponent(id) +
+          (before ? "&before=" + encodeURIComponent(before.createdAt) + "&beforeId=" + encodeURIComponent(before.id) : ""))) || [];
+        if (!valid()) return;
+        const ordered = mergeMessages([], rows);
+        const previous = messagesRef.current;
+        const merged = mergeMessages(previous, ordered);
+        const knownIds = new Set(previous.map(message => message.id));
+        // A disjoint, newer recent window leaves a gap, even if history was exhausted.
+        // Use the synchronous collection so concurrent responses see the same frontier.
+        const gap = !older && previous.length > 0 && ordered.length > 0 &&
+          !ordered.some(message => knownIds.has(message.id)) &&
+          merged[merged.length - 1].id === ordered[ordered.length - 1].id;
+        messagesRef.current = merged;
+        setMessages(merged);
+        // A history request started before a gap was discovered may merge its rows,
+        // but must not overwrite the new recovery cursor or exhaust that gap.
+        if ((older && historyCursor.current === before) || (!older && historyCursor.current === null) || gap) {
+          historyCursor.current = ordered[0] ? { createdAt: ordered[0].createdAt, id: ordered[0].id } : before;
+          setHasOlder(gap || rows.length === 100);
+        }
       } catch (e) {
-        setNotice((e as Error).message);
+        if (valid()) setChatError((e as Error).message);
+      } finally {
+        if (older && valid()) { historyPending.current = false; setHistoryBusy(false); }
       }
     },
     [get],
@@ -274,10 +369,10 @@ export default function Home() {
   useEffect(() => {
     if (!match || demo) return;
     void refreshMessages(match.id);
+    const timer = window.setInterval(() => { void refreshMessages(match.id); }, 15000);
     const client = browserClient();
-    if (!client) return;
     const ch = client
-      .channel("chat:" + match.id)
+      ?.channel("chat:" + match.id)
       .on(
         "postgres_changes",
         {
@@ -292,10 +387,13 @@ export default function Home() {
       )
       .subscribe();
     return () => {
-      void client.removeChannel(ch);
+      window.clearInterval(timer);
+      if (client && ch) void client.removeChannel(ch);
     };
   }, [match, demo, refreshMessages]);
   function enter(isDemo = false) {
+    if (isDemo || demoMode.current) clearPrivate();
+    demoMode.current = isDemo;
     setApp(true);
     setDemo(isDemo);
     setTab("discover");
@@ -310,9 +408,13 @@ export default function Home() {
       setNotice("Demonstração sintética: nenhuma alteração foi salva.");
       return false;
     }
+    const epoch = identityEpoch.current;
+    const chat = fields.matchId ? chatEpoch.current : null;
+    const valid = () => epoch === identityEpoch.current && (chat === null || chat === chatEpoch.current);
     setBusy(true);
     try {
       const r = await api("/api/action", { action, ...fields });
+      if (!valid()) return false;
       setNotice(
         r.data?.match_id || r.data?.matchId
           ? "É match! Abra Conversas para dar o primeiro oi."
@@ -320,10 +422,10 @@ export default function Home() {
       );
       return true;
     } catch (e) {
-      setNotice((e as Error).message);
+      if (valid()) setNotice((e as Error).message);
       return false;
     } finally {
-      setBusy(false);
+      if (valid()) setBusy(false);
     }
   }
   async function authSubmit(e: FormEvent<HTMLFormElement>) {
@@ -768,19 +870,19 @@ export default function Home() {
               <button
                 aria-label="Sair"
                 onClick={async () => {
-                  if (demo) {
+                    const wasDemo = demo;
+                    demoMode.current = true; // Suspend session reloads until explicit re-entry.
+                    clearPrivate();
                     setDemo(false);
                     setApp(false);
-                    return;
-                  }
-                  try {
-                    await api("/api/auth", { action: "logout" });
-                    setSession(null);
-                    setProfile(null);
-                    setApp(false);
-                  } catch (e) {
-                    setNotice((e as Error).message);
-                  }
+                    history.replaceState({}, "", "/");
+                    if (wasDemo) return;
+                    const epoch = identityEpoch.current;
+                    try {
+                      await api("/api/auth", { action: "logout" });
+                    } catch (e) {
+                      if (epoch === identityEpoch.current) setNotice((e as Error).message);
+                    }
                 }}
               >
                 <LogOut size={18} />
@@ -1201,6 +1303,10 @@ export default function Home() {
                               key={m.id}
                               className={match?.id === m.id ? "selected" : ""}
                               onClick={() => {
+                                if (selectedChat.current === m.id) return;
+                                resetChat();
+                                selectedChat.current = m.id;
+                                setBusy(false);
                                 setMatch(m);
                                 if (!demo)
                                   void action("read", { matchId: m.id });
@@ -1257,6 +1363,18 @@ export default function Home() {
                               </div>
                             </header>
                             <div className="message-list" aria-live="polite">
+                              {chatError && <p role="alert">{chatError}</p>}
+                              {hasOlder && (
+                                <button type="button" className="text-button" disabled={historyBusy}
+                                  onClick={() => void refreshMessages(match.id, true)}>
+                                  Carregar mensagens antigas
+                                </button>
+                              )}
+                              {chatError && !hasOlder && (
+                                <button type="button" className="text-button" onClick={() => void refreshMessages(match.id)}>
+                                  Tentar novamente
+                                </button>
+                              )}
                               {messages.map((m) => (
                                 <div
                                   key={m.id}
@@ -1278,6 +1396,7 @@ export default function Home() {
                               ))}
                             </div>
                             <form
+                              key={match.id}
                               className="message-form"
                               onSubmit={async (e) => {
                                 e.preventDefault();
@@ -2187,10 +2306,11 @@ export default function Home() {
                 });
                 if (ok) {
                   if (confirm === "delete") {
-                    setSession(null);
+                    demoMode.current = true;
+                    clearPrivate();
                     setApp(false);
                   } else if (tab === "chat") {
-                    setMatch(null);
+                    resetChat();
                     setMatches(await get("matches"));
                   } else setIndex(index + 1);
                   setConfirm("");
